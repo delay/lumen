@@ -331,12 +331,13 @@ generate_ripple_shader() {
     '                              length(vec2((1.0 - origin.x) * aspect, origin.y))),' \
     '                          max(length(vec2(origin.x * aspect, 1.0 - origin.y)),' \
     '                              length(vec2((1.0 - origin.x) * aspect, 1.0 - origin.y))));' \
-    '    float front = progress * (maxRadius + 0.08);' \
+    '    float front = progress * (maxRadius + 0.30);' \
     '    float ringDistance = distanceFromOrigin - front;' \
     '    float rippleEnvelope = exp(-pow(ringDistance / 0.105, 2.0));' \
     '    float primaryRipple = sin(ringDistance * 105.0);' \
     '    float fineRipple = sin(ringDistance * 185.0 + 0.8);' \
-    '    float ripple = (primaryRipple * 0.72 + fineRipple * 0.28) * rippleEnvelope;' \
+    '    float endFade = 1.0 - smoothstep(0.82, 1.0, progress);' \
+    '    float ripple = (primaryRipple * 0.72 + fineRipple * 0.28) * rippleEnvelope * endFade;' \
     '    vec2 direction = distanceFromOrigin > 0.0001 ? scaledDelta / distanceFromOrigin : vec2(0.0);' \
     '    vec2 offset = direction * ripple * 0.120 * (1.0 - progress * 0.25);' \
     '    offset.x /= aspect;' \
@@ -410,10 +411,6 @@ apply_settings_with_ripple() {
   set_damage_tracking 0
   apply_shader "$TRANSITION_SHADER"
   sleep "$RIPPLE_DURATION_SECONDS"
-  # Hyprland accepts the shader path before the render thread necessarily
-  # presents its first animated frame. Keep it installed briefly after the
-  # nominal duration so a late first frame cannot truncate the wave.
-  sleep 0.3
   apply_settings "$temperature" "$saturation" "$mode"
   restore_damage_tracking
   RIPPLE_PREVIOUS_DAMAGE=""

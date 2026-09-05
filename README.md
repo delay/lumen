@@ -9,8 +9,6 @@ presets one click away.
 
 <video src="https://github.com/user-attachments/assets/fec81f11-496b-4378-ae5c-28738cca7d25" autoplay loop muted playsinline controls title="Lumen display presets demo"></video>
 
-[Play the Lumen demo](https://github.com/user-attachments/assets/fec81f11-496b-4378-ae5c-28738cca7d25)
-
 ## Features
 
 - Six editable presets: Standard, Red Light, Candle, Black & White, Color Ink,

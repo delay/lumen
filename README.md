@@ -120,11 +120,10 @@ Run `./lumen` without arguments to see the complete command synopsis.
 
 ## Local development
 
-Clone the repository and install it through Omarchy:
+From a local checkout of this repository, validate and install it through
+Omarchy:
 
 ```bash
-git clone https://github.com/delay/lumen.git
-cd lumen
 omarchy plugin validate .
 omarchy plugin add "$(pwd)" --enable
 ```
@@ -150,7 +149,7 @@ set.
 Omarchy plugins run as unsandboxed user code, so review a plugin before
 installing it. Lumen:
 
-- Does not use the network, `sudo`, `pkexec`, or downloaded code.
+- Makes no runtime network requests and requires no elevated permissions.
 - Does not read credentials or personal files.
 - Runs only its bundled `lumen` helper plus `hyprctl` and
   `omarchy-brightness-display`.

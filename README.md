@@ -65,6 +65,19 @@ To update an installed copy later:
 omarchy plugin update delay.lumen
 ```
 
+## Removal
+
+Remove Lumen through Omarchy:
+
+```bash
+omarchy plugin remove delay.lumen
+```
+
+Removing the plugin leaves your presets and schedule in
+`~/.local/state/lumen` (or `$XDG_STATE_HOME/lumen`) so they are available if
+you reinstall it. You can delete that directory manually if you also want to
+remove Lumen's saved settings.
+
 ## Usage
 
 Left-click the Lumen bar icon to open the preset panel, then select a preset to
@@ -78,10 +91,11 @@ there you can:
 - Configure two daily schedule switch times and their target presets.
 - Turn the ripple animation on or off.
 
-Schedule times use 24-hour `HH:MM` format. Lumen checks the schedule every 30
-seconds and remembers the last applied event, so restarting the shell catches
-up with the current scheduled period without repeatedly overriding a manual
-change.
+Schedule times follow the 12- or 24-hour format configured for Omarchy's clock.
+Lumen stores them internally as 24-hour `HH:MM` values, checks the schedule
+every 30 seconds, and remembers the last applied event. Restarting the shell
+therefore catches up with the current scheduled period without repeatedly
+overriding a manual change.
 
 Brightness uses **Auto** by default. Dragging the brightness slider turns Auto
 off and saves an override for that preset. Turning Auto back on restores the
@@ -130,6 +144,24 @@ then replace it with the final static shader. Brightness overrides use
 Omarchy's native display-brightness control. User settings are stored under
 `$XDG_STATE_HOME/lumen`, or `~/.local/state/lumen` when `XDG_STATE_HOME` is not
 set.
+
+## Security and system access
+
+Omarchy plugins run as unsandboxed user code, so review a plugin before
+installing it. Lumen:
+
+- Does not use the network, `sudo`, `pkexec`, or downloaded code.
+- Does not read credentials or personal files.
+- Runs only its bundled `lumen` helper plus `hyprctl` and
+  `omarchy-brightness-display`.
+- Changes Hyprland's `decoration:screen_shader` setting while a color mode is
+  active.
+- Temporarily changes `debug:damage_tracking` during an animated transition and
+  restores its previous value afterward.
+- Changes display brightness only when a preset has a manual brightness
+  override.
+- Stores preset and scheduling state only in the user state directory described
+  above.
 
 ## License
 

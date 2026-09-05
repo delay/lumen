@@ -551,7 +551,8 @@ schedule_check() {
   read -r enabled time1 preset1 time2 preset2 <<<"$(schedule_state)"
   [[ $enabled == 1 ]] || { printf 'none\n'; return; }
 
-  lock_file="${XDG_RUNTIME_DIR:-/tmp}/lumen-schedule.lock"
+  mkdir -p "$STATE_DIR"
+  lock_file="${XDG_RUNTIME_DIR:-$STATE_DIR}/lumen-schedule.lock"
   exec {schedule_lock_fd}>"$lock_file"
   flock -n "$schedule_lock_fd" || { printf 'none\n'; return; }
 

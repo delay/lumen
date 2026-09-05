@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "id": "delay.lumen",
+  "name": "Lumen",
+  "version": "0.5.0",
+  "author": "delay",
+  "license": "MIT",
+  "description": "Apply editable display color presets from the Omarchy bar.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Lumen",
+    "description": "Editable color and optional brightness presets",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "animationEnabled": true,
+      "hiddenPresets": ""
+    },
+    "schema": [
+      {
+        "key": "animationEnabled",
+        "type": "boolean",
+        "label": "Preset animation"
+      }
+    ]
+  }
+}

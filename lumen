@@ -1,0 +1,661 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PLUGIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/lumen"
+STATE_FILE="$STATE_DIR/mode"
+TEMPERATURE_FILE="$STATE_DIR/temperature"
+SATURATION_FILE="$STATE_DIR/saturation"
+PRESET_DIR="$STATE_DIR/presets"
+CUSTOM_NAME_DIR="$STATE_DIR/custom-names"
+CUSTOM_DEFAULT_DIR="$STATE_DIR/custom-defaults"
+SCHEDULE_FILE="$STATE_DIR/schedule"
+SCHEDULE_MARKER_FILE="$STATE_DIR/schedule-last-event"
+BRIGHTNESS_BASELINE_FILE="$STATE_DIR/brightness-before-override"
+GENERATED_SHADER="$STATE_DIR/color-temperature.glsl"
+TRANSITION_SHADER="$STATE_DIR/ripple-transition.glsl"
+RIPPLE_DURATION_SECONDS=3.0
+RIPPLE_PREVIOUS_DAMAGE=""
+
+usage() {
+  printf 'Usage: lumen {status|state|preset MODE|custom-list|add-preset NAME|rename-preset MODE NAME|delete-preset MODE|set MODE|set-preset MODE KELVIN PERCENT [BRIGHTNESS|auto]|reset-preset MODE|schedule-state|schedule-set ENABLED TIME1 MODE1 TIME2 MODE2|schedule-check}\n' >&2
+}
+
+is_builtin_preset() {
+  case "$1" in
+    standard|red-light|candle|black-white|color-ink|vivid) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+preset_exists() {
+  is_builtin_preset "$1" || [[ $1 == custom-* && -r $PRESET_DIR/$1 && -r $CUSTOM_NAME_DIR/$1 ]]
+}
+
+saved_temperature() {
+  local temperature
+  if [[ -r $TEMPERATURE_FILE ]]; then
+    read -r temperature < "$TEMPERATURE_FILE"
+    if [[ $temperature =~ ^[0-9]+$ ]] && (( temperature >= 1000 && temperature <= 7000 )); then
+      printf '%s\n' "$temperature"
+      return
+    fi
+  fi
+  printf '6500\n'
+}
+
+saved_mode() {
+  local mode
+  if [[ -r $STATE_FILE ]]; then
+    read -r mode < "$STATE_FILE"
+    if [[ $mode == custom ]] || preset_exists "$mode"; then printf '%s\n' "$mode"; return; fi
+  fi
+  printf 'standard\n'
+}
+
+saved_saturation() {
+  local saturation
+  if [[ -r $SATURATION_FILE ]]; then
+    read -r saturation < "$SATURATION_FILE"
+    if [[ $saturation =~ ^[0-9]+$ ]] && (( saturation >= 0 && saturation <= 200 )); then
+      printf '%s\n' "$saturation"
+      return
+    fi
+  fi
+  printf '100\n'
+}
+
+preset_defaults() {
+  case "$1" in
+    standard) printf '6500 100 auto\n' ;;
+    red-light) printf '1000 100 auto\n' ;;
+    candle) printf '1800 90 auto\n' ;;
+    black-white) printf '6500 0 auto\n' ;;
+    color-ink) printf '6500 40 auto\n' ;;
+    vivid) printf '6500 160 auto\n' ;;
+    custom-*)
+      if [[ -r $CUSTOM_DEFAULT_DIR/$1 ]]; then
+        sed -n '1p' "$CUSTOM_DEFAULT_DIR/$1"
+      else
+        printf 'Unknown Lumen preset: %s\n' "$1" >&2
+        return 2
+      fi
+      ;;
+    *) printf 'Unknown Lumen preset: %s\n' "$1" >&2; return 2 ;;
+  esac
+}
+
+saved_preset() {
+  local preset=$1 temperature saturation brightness=auto preset_file="$PRESET_DIR/$1"
+  if [[ -r $preset_file ]]; then
+    read -r temperature saturation brightness < "$preset_file"
+    brightness=${brightness:-auto}
+    if [[ $temperature =~ ^[0-9]+$ && $saturation =~ ^[0-9]+$ \
+        && $temperature -ge 1000 && $temperature -le 7000 \
+        && $saturation -ge 0 && $saturation -le 200 \
+        && ( $brightness == auto || ( $brightness =~ ^[0-9]+$ \
+          && $brightness -ge 1 && $brightness -le 100 ) ) ]]; then
+      printf '%s %s %s\n' "$temperature" "$saturation" "$brightness"
+      return
+    fi
+  fi
+  preset_defaults "$preset"
+}
+
+save_preset() {
+  local preset=$1 temperature=$2 saturation=$3 brightness=${4:-auto}
+  mkdir -p "$PRESET_DIR"
+  printf '%s %s %s\n' "$temperature" "$saturation" "$brightness" > "$PRESET_DIR/$preset"
+}
+
+clean_name() {
+  local name=${1//$'\n'/ }
+  name=${name//$'\t'/ }
+  name=${name#"${name%%[![:space:]]*}"}
+  name=${name%"${name##*[![:space:]]}"}
+  name=${name:0:32}
+  [[ -n $name ]] || name='Custom Preset'
+  printf '%s\n' "$name"
+}
+
+custom_list() {
+  local name_file id name encoded temperature saturation brightness
+  [[ -d $CUSTOM_NAME_DIR ]] || return 0
+  while IFS= read -r name_file; do
+    id=${name_file##*/}
+    preset_exists "$id" || continue
+    read -r name < "$name_file"
+    encoded=$(printf '%s' "$name" | base64 -w0)
+    read -r temperature saturation brightness <<<"$(saved_preset "$id")"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$encoded" "$temperature" "$saturation" "$brightness"
+  done < <(find "$CUSTOM_NAME_DIR" -maxdepth 1 -type f -name 'custom-*' -print | sort)
+}
+
+add_preset() {
+  local name id temperature saturation
+  name=$(clean_name "$1")
+  id="custom-$(date +%s%N)-$RANDOM"
+  temperature=$(saved_temperature)
+  saturation=$(saved_saturation)
+  mkdir -p "$CUSTOM_NAME_DIR" "$CUSTOM_DEFAULT_DIR"
+  printf '%s\n' "$name" > "$CUSTOM_NAME_DIR/$id"
+  printf '%s %s auto\n' "$temperature" "$saturation" > "$CUSTOM_DEFAULT_DIR/$id"
+  save_preset "$id" "$temperature" "$saturation" auto
+  printf '%s\n' "$id"
+}
+
+rename_preset() {
+  local preset=$1 name
+  [[ $preset == custom-* ]] && preset_exists "$preset" || {
+    printf 'Only custom presets can be renamed.\n' >&2; exit 2;
+  }
+  name=$(clean_name "$2")
+  printf '%s\n' "$name" > "$CUSTOM_NAME_DIR/$preset"
+  printf '%s\n' "$preset"
+}
+
+delete_preset() {
+  local preset=$1 enabled time1 preset1 time2 preset2
+  [[ $preset == custom-* ]] && preset_exists "$preset" || {
+    printf 'Only custom presets can be deleted.\n' >&2; exit 2;
+  }
+  if [[ $(saved_mode) == "$preset" ]]; then set_mode standard; fi
+  if [[ -r $SCHEDULE_FILE ]]; then
+    read -r enabled time1 preset1 time2 preset2 < "$SCHEDULE_FILE"
+    [[ $preset1 != "$preset" ]] || preset1=standard
+    [[ $preset2 != "$preset" ]] || preset2=standard
+    printf '%s %s %s %s %s\n' "$enabled" "$time1" "$preset1" "$time2" "$preset2" > "$SCHEDULE_FILE"
+    rm -f -- "$SCHEDULE_MARKER_FILE"
+  fi
+  rm -f -- "$PRESET_DIR/$preset" "$CUSTOM_NAME_DIR/$preset" "$CUSTOM_DEFAULT_DIR/$preset"
+  printf '%s\n' "$preset"
+}
+
+current_brightness() {
+  local brightness
+  brightness=$(omarchy-brightness-display 2>/dev/null || true)
+  if [[ $brightness =~ ^[0-9]+$ && $brightness -ge 1 && $brightness -le 100 ]]; then
+    printf '%s\n' "$brightness"
+  else
+    printf '%s\n' '-1'
+  fi
+}
+
+apply_preset_brightness() {
+  local brightness=$1 baseline current
+  command -v omarchy-brightness-display >/dev/null 2>&1 || return 0
+
+  if [[ $brightness == auto ]]; then
+    if [[ -r $BRIGHTNESS_BASELINE_FILE ]]; then
+      read -r baseline < "$BRIGHTNESS_BASELINE_FILE"
+      if [[ $baseline =~ ^[0-9]+$ && $baseline -ge 1 && $baseline -le 100 ]]; then
+        omarchy-brightness-display --no-osd "${baseline}%" >/dev/null
+      fi
+      rm -f -- "$BRIGHTNESS_BASELINE_FILE"
+    fi
+    return 0
+  fi
+
+  if [[ ! -r $BRIGHTNESS_BASELINE_FILE ]]; then
+    current=$(current_brightness)
+    if [[ $current =~ ^[0-9]+$ && $current -ge 1 && $current -le 100 ]]; then
+      mkdir -p "$STATE_DIR"
+      printf '%s\n' "$current" > "$BRIGHTNESS_BASELINE_FILE"
+    fi
+  fi
+  omarchy-brightness-display --no-osd "${brightness}%" >/dev/null
+}
+
+status() {
+  local mode active_shader temperature saturation brightness
+  mode=$(saved_mode)
+  active_shader=$(hyprctl getoption decoration:screen_shader 2>/dev/null || true)
+  if [[ $mode == custom ]]; then
+    printf 'custom\n'
+    return
+  fi
+  read -r temperature saturation brightness <<<"$(saved_preset "$mode")"
+  if (( temperature == 6500 && saturation == 100 )); then
+    if grep -Fq 'str: [[EMPTY]]' <<<"$active_shader"; then printf '%s\n' "$mode"; else printf 'standard\n'; fi
+  elif grep -Fq "str: $GENERATED_SHADER" <<<"$active_shader"; then
+    printf '%s\n' "$mode"
+  else
+    printf 'standard\n'
+  fi
+}
+
+generate_color_shader() {
+  local kelvin=$1 saturation=$2 rgb red green blue saturation_factor
+  rgb=$(awk -v kelvin="$kelvin" 'BEGIN {
+    t = kelvin / 100.0
+    if (t <= 66) r = 255; else r = 329.698727446 * ((t - 60) ^ -0.1332047592)
+    if (t <= 66) g = 99.4708025861 * log(t) - 161.1195681661
+    else g = 288.1221695283 * ((t - 60) ^ -0.0755148492)
+    if (t >= 66) b = 255
+    else if (t <= 19) b = 0
+    else b = 138.5177312231 * log(t - 10) - 305.0447927307
+    r = r < 0 ? 0 : (r > 255 ? 255 : r)
+    g = g < 0 ? 0 : (g > 255 ? 255 : g)
+    b = b < 0 ? 0 : (b > 255 ? 255 : b)
+    printf "%.6f %.6f %.6f", r / 255.0, g / 255.0, b / 255.0
+  }')
+  read -r red green blue <<<"$rgb"
+  saturation_factor=$(awk -v saturation="$saturation" 'BEGIN { printf "%.6f", saturation / 100.0 }')
+
+  mkdir -p "$STATE_DIR"
+  printf '%s\n' \
+    '#version 300 es' \
+    'precision highp float;' \
+    '' \
+    'in vec2 v_texcoord;' \
+    'uniform sampler2D tex;' \
+    'out vec4 fragColor;' \
+    '' \
+    'void main() {' \
+    '    vec4 source = texture(tex, v_texcoord);' \
+    "    vec3 whitePoint = vec3($red, $green, $blue);" \
+    '    vec3 temperatureColor = source.rgb * whitePoint;' \
+    '    float luminance = dot(temperatureColor, vec3(0.2126, 0.7152, 0.0722));' \
+    "    vec3 adjusted = mix(vec3(luminance), temperatureColor, $saturation_factor);" \
+    '    fragColor = vec4(adjusted, source.a);' \
+    '}' > "$GENERATED_SHADER"
+}
+
+color_coefficients() {
+  local kelvin=$1 saturation=$2
+  awk -v kelvin="$kelvin" -v saturation="$saturation" 'BEGIN {
+    t = kelvin / 100.0
+    if (t <= 66) r = 255; else r = 329.698727446 * ((t - 60) ^ -0.1332047592)
+    if (t <= 66) g = 99.4708025861 * log(t) - 161.1195681661
+    else g = 288.1221695283 * ((t - 60) ^ -0.0755148492)
+    if (t >= 66) b = 255
+    else if (t <= 19) b = 0
+    else b = 138.5177312231 * log(t - 10) - 305.0447927307
+    r = r < 0 ? 0 : (r > 255 ? 255 : r)
+    g = g < 0 ? 0 : (g > 255 ? 255 : g)
+    b = b < 0 ? 0 : (b > 255 ? 255 : b)
+    printf "%.6f %.6f %.6f %.6f", r / 255.0, g / 255.0, b / 255.0, saturation / 100.0
+  }'
+}
+
+generate_ripple_shader() {
+  local from_temperature=$1 from_saturation=$2 to_temperature=$3 to_saturation=$4
+  local origin_x=$5 origin_y=$6 screen_width=$7 screen_height=$8
+  local from_values to_values from_r from_g from_b from_s to_r to_g to_b to_s
+  local normalized_x normalized_y aspect
+
+  from_values=$(color_coefficients "$from_temperature" "$from_saturation")
+  to_values=$(color_coefficients "$to_temperature" "$to_saturation")
+  read -r from_r from_g from_b from_s <<<"$from_values"
+  read -r to_r to_g to_b to_s <<<"$to_values"
+  read -r normalized_x normalized_y aspect < <(awk \
+    -v x="$origin_x" -v y="$origin_y" -v width="$screen_width" -v height="$screen_height" \
+    'BEGIN {
+      if (width <= 0) width = 1
+      if (height <= 0) height = 1
+      x = x < 0 ? 0 : (x > width ? width : x)
+      y = y < 0 ? 0 : (y > height ? height : y)
+      printf "%.6f %.6f %.6f\n", x / width, y / height, width / height
+    }')
+
+  mkdir -p "$STATE_DIR"
+  printf '%s\n' \
+    '#version 300 es' \
+    'precision highp float;' \
+    '' \
+    'in vec2 v_texcoord;' \
+    'uniform sampler2D tex;' \
+    'uniform float time;' \
+    'out vec4 fragColor;' \
+    '' \
+    "const vec2 origin = vec2($normalized_x, $normalized_y);" \
+    "const float aspect = $aspect;" \
+    "const float duration = $RIPPLE_DURATION_SECONDS;" \
+    "const vec3 fromWhite = vec3($from_r, $from_g, $from_b);" \
+    "const vec3 toWhite = vec3($to_r, $to_g, $to_b);" \
+    "const float fromSaturation = $from_s;" \
+    "const float toSaturation = $to_s;" \
+    '' \
+    'vec3 grade(vec3 color, vec3 whitePoint, float saturation) {' \
+    '    vec3 temperatureColor = color * whitePoint;' \
+    '    float luminance = dot(temperatureColor, vec3(0.2126, 0.7152, 0.0722));' \
+    '    return mix(vec3(luminance), temperatureColor, saturation);' \
+    '}' \
+    '' \
+    'void main() {' \
+    '    float progress = smoothstep(0.0, duration, time);' \
+    '    vec2 delta = v_texcoord - origin;' \
+    '    vec2 scaledDelta = vec2(delta.x * aspect, delta.y);' \
+    '    float distanceFromOrigin = length(scaledDelta);' \
+    '    float maxRadius = max(max(length(vec2(origin.x * aspect, origin.y)),' \
+    '                              length(vec2((1.0 - origin.x) * aspect, origin.y))),' \
+    '                          max(length(vec2(origin.x * aspect, 1.0 - origin.y)),' \
+    '                              length(vec2((1.0 - origin.x) * aspect, 1.0 - origin.y))));' \
+    '    float front = progress * (maxRadius + 0.08);' \
+    '    float ringDistance = distanceFromOrigin - front;' \
+    '    float rippleEnvelope = exp(-pow(ringDistance / 0.105, 2.0));' \
+    '    float primaryRipple = sin(ringDistance * 105.0);' \
+    '    float fineRipple = sin(ringDistance * 185.0 + 0.8);' \
+    '    float ripple = (primaryRipple * 0.72 + fineRipple * 0.28) * rippleEnvelope;' \
+    '    vec2 direction = distanceFromOrigin > 0.0001 ? scaledDelta / distanceFromOrigin : vec2(0.0);' \
+    '    vec2 offset = direction * ripple * 0.120 * (1.0 - progress * 0.25);' \
+    '    offset.x /= aspect;' \
+    '    vec4 source = texture(tex, clamp(v_texcoord + offset, 0.0, 1.0));' \
+    '    vec3 before = grade(source.rgb, fromWhite, fromSaturation);' \
+    '    vec3 after = grade(source.rgb, toWhite, toSaturation);' \
+    '    float coverage = 1.0 - smoothstep(front - 0.025, front + 0.025, distanceFromOrigin);' \
+    '    vec3 color = mix(before, after, coverage);' \
+    '    float crest = max(ripple, 0.0) * rippleEnvelope;' \
+    '    color += crest * 0.035 * (1.0 - progress * 0.6);' \
+    '    fragColor = vec4(color, source.a);' \
+    '}' > "$TRANSITION_SHADER"
+}
+
+damage_tracking_value() {
+  hyprctl getoption debug:damage_tracking 2>/dev/null | awk '/^int:/ { print $2; exit }'
+}
+
+set_damage_tracking() {
+  local value=$1
+  hyprctl eval "hl.config({ debug = { damage_tracking = $value } })" >/dev/null
+}
+
+restore_damage_tracking() {
+  if [[ $RIPPLE_PREVIOUS_DAMAGE =~ ^[0-9]+$ ]]; then
+    set_damage_tracking "$RIPPLE_PREVIOUS_DAMAGE" 2>/dev/null || true
+  fi
+}
+
+apply_shader() {
+  local shader=$1 escaped_shader active_shader
+  command -v hyprctl >/dev/null 2>&1 || {
+    printf 'Lumen requires Hyprland (hyprctl was not found).\n' >&2
+    exit 1
+  }
+  escaped_shader=${shader//\\/\\\\}
+  escaped_shader=${escaped_shader//\"/\\\"}
+  hyprctl eval "hl.config({ decoration = { screen_shader = \"$escaped_shader\" } })" >/dev/null
+  active_shader=$(hyprctl getoption decoration:screen_shader)
+  grep -Fq "str: $shader" <<<"$active_shader" || {
+    printf 'Hyprland did not activate the Lumen shader.\n' >&2
+    exit 1
+  }
+}
+
+set_mode() {
+  local mode=$1 ripple=${2:-} origin_x=${3:-} origin_y=${4:-} screen_width=${5:-} screen_height=${6:-}
+  local temperature saturation brightness
+  read -r temperature saturation brightness <<<"$(saved_preset "$mode")"
+  if [[ $ripple == --ripple && $origin_x =~ ^-?[0-9]+([.][0-9]+)?$ \
+      && $origin_y =~ ^-?[0-9]+([.][0-9]+)?$ \
+      && $screen_width =~ ^[0-9]+([.][0-9]+)?$ \
+      && $screen_height =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    apply_settings_with_ripple "$temperature" "$saturation" "$mode" \
+      "$origin_x" "$origin_y" "$screen_width" "$screen_height"
+  else
+    apply_settings "$temperature" "$saturation" "$mode"
+  fi
+  apply_preset_brightness "$brightness"
+}
+
+apply_settings_with_ripple() {
+  local temperature=$1 saturation=$2 mode=$3 origin_x=$4 origin_y=$5 screen_width=$6 screen_height=$7
+  RIPPLE_PREVIOUS_DAMAGE=$(damage_tracking_value)
+  [[ $RIPPLE_PREVIOUS_DAMAGE =~ ^[0-9]+$ ]] || RIPPLE_PREVIOUS_DAMAGE=2
+
+  generate_ripple_shader "$(saved_temperature)" "$(saved_saturation)" \
+    "$temperature" "$saturation" "$origin_x" "$origin_y" "$screen_width" "$screen_height"
+
+  trap restore_damage_tracking EXIT INT TERM
+  set_damage_tracking 0
+  apply_shader "$TRANSITION_SHADER"
+  sleep "$RIPPLE_DURATION_SECONDS"
+  # Hyprland accepts the shader path before the render thread necessarily
+  # presents its first animated frame. Keep it installed briefly after the
+  # nominal duration so a late first frame cannot truncate the wave.
+  sleep 0.3
+  apply_settings "$temperature" "$saturation" "$mode"
+  restore_damage_tracking
+  RIPPLE_PREVIOUS_DAMAGE=""
+  trap - EXIT INT TERM
+}
+
+set_temperature() {
+  local temperature=$1
+  [[ $temperature =~ ^[0-9]+$ ]] || {
+    printf 'Temperature must be a whole number from 1000 to 7000 K.\n' >&2
+    exit 2
+  }
+  (( temperature >= 1000 && temperature <= 7000 )) || {
+    printf 'Temperature must be between 1000 and 7000 K.\n' >&2
+    exit 2
+  }
+  temperature=$(( (temperature + 50) / 100 * 100 ))
+  apply_settings "$temperature" "$(saved_saturation)"
+}
+
+set_saturation() {
+  local saturation=$1
+  [[ $saturation =~ ^[0-9]+$ ]] || {
+    printf 'Saturation must be a whole number from 0 to 200 percent.\n' >&2
+    exit 2
+  }
+  (( saturation >= 0 && saturation <= 200 )) || {
+    printf 'Saturation must be between 0 and 200 percent.\n' >&2
+    exit 2
+  }
+  saturation=$(( (saturation + 2) / 5 * 5 ))
+  apply_settings "$(saved_temperature)" "$saturation"
+}
+
+apply_settings() {
+  local temperature=$1 saturation=$2 requested_mode=${3:-} mode shader
+  mkdir -p "$STATE_DIR"
+  if [[ -n $requested_mode ]]; then
+    mode=$requested_mode
+  elif (( temperature == 6500 && saturation == 100 )); then
+    mode=standard
+  elif (( temperature == 1000 && saturation == 100 )); then
+    mode=red-light
+  else
+    mode=custom
+  fi
+  if (( temperature == 6500 && saturation == 100 )); then
+    shader='[[EMPTY]]'
+  else
+    generate_color_shader "$temperature" "$saturation"
+    shader="$GENERATED_SHADER"
+  fi
+  apply_shader "$shader"
+  printf '%s\n' "$temperature" > "$TEMPERATURE_FILE"
+  printf '%s\n' "$saturation" > "$SATURATION_FILE"
+  printf '%s\n' "$mode" > "$STATE_FILE"
+  printf '%s\n' "$mode"
+}
+
+set_preset() {
+  local preset=$1 temperature=$2 saturation=$3 brightness=${4:-auto}
+  preset_defaults "$preset" >/dev/null
+  [[ $temperature =~ ^[0-9]+$ && $saturation =~ ^[0-9]+$ ]] || {
+    printf 'Preset values must be whole numbers.\n' >&2
+    exit 2
+  }
+  (( temperature >= 1000 && temperature <= 7000 )) || {
+    printf 'Temperature must be between 1000 and 7000 K.\n' >&2
+    exit 2
+  }
+  (( saturation >= 0 && saturation <= 200 )) || {
+    printf 'Saturation must be between 0 and 200 percent.\n' >&2
+    exit 2
+  }
+  if [[ $brightness != auto ]]; then
+    [[ $brightness =~ ^[0-9]+$ ]] || {
+      printf 'Brightness must be auto or a whole number from 1 to 100 percent.\n' >&2
+      exit 2
+    }
+    (( brightness >= 1 && brightness <= 100 )) || {
+      printf 'Brightness must be between 1 and 100 percent.\n' >&2
+      exit 2
+    }
+  fi
+  temperature=$(( (temperature + 50) / 100 * 100 ))
+  saturation=$(( (saturation + 2) / 5 * 5 ))
+  apply_settings "$temperature" "$saturation" "$preset"
+  apply_preset_brightness "$brightness"
+  save_preset "$preset" "$temperature" "$saturation" "$brightness"
+}
+
+reset_preset() {
+  local preset=$1 temperature saturation brightness
+  read -r temperature saturation brightness <<<"$(preset_defaults "$preset")"
+  apply_settings "$temperature" "$saturation" "$preset"
+  apply_preset_brightness "$brightness"
+  save_preset "$preset" "$temperature" "$saturation" "$brightness"
+}
+
+valid_time() {
+  local value=$1 hour minute
+  [[ $value =~ ^([01][0-9]|2[0-3]):([0-5][0-9])$ ]] || return 1
+  IFS=: read -r hour minute <<<"$value"
+  (( 10#$hour <= 23 && 10#$minute <= 59 ))
+}
+
+schedule_state() {
+  local enabled time1 preset1 time2 preset2
+  if [[ -r $SCHEDULE_FILE ]]; then
+    read -r enabled time1 preset1 time2 preset2 < "$SCHEDULE_FILE"
+    if [[ $enabled =~ ^[01]$ ]] && valid_time "$time1" && valid_time "$time2" \
+        && preset_exists "$preset1" && preset_exists "$preset2"; then
+      printf '%s %s %s %s %s\n' "$enabled" "$time1" "$preset1" "$time2" "$preset2"
+      return
+    fi
+  fi
+  printf '0 08:00 standard 20:00 red-light\n'
+}
+
+schedule_set() {
+  local enabled=$1 time1=$2 preset1=$3 time2=$4 preset2=$5
+  [[ $enabled =~ ^[01]$ ]] || { printf 'Schedule enabled must be 0 or 1.\n' >&2; exit 2; }
+  valid_time "$time1" && valid_time "$time2" || {
+    printf 'Schedule times must use 24-hour HH:MM format.\n' >&2; exit 2;
+  }
+  preset_exists "$preset1" && preset_exists "$preset2" || {
+    printf 'Schedule presets must exist.\n' >&2; exit 2;
+  }
+  mkdir -p "$STATE_DIR"
+  printf '%s %s %s %s %s\n' "$enabled" "$time1" "$preset1" "$time2" "$preset2" > "$SCHEDULE_FILE"
+  rm -f -- "$SCHEDULE_MARKER_FILE"
+  schedule_state
+}
+
+schedule_check() {
+  local enabled time1 preset1 time2 preset2 hour minute now_minutes t1_minutes t2_minutes
+  local age1 age2 target event_epoch_minutes marker previous lock_file
+  read -r enabled time1 preset1 time2 preset2 <<<"$(schedule_state)"
+  [[ $enabled == 1 ]] || { printf 'none\n'; return; }
+
+  lock_file="${XDG_RUNTIME_DIR:-/tmp}/lumen-schedule.lock"
+  exec {schedule_lock_fd}>"$lock_file"
+  flock -n "$schedule_lock_fd" || { printf 'none\n'; return; }
+
+  IFS=: read -r hour minute <<<"$(date +%H:%M)"
+  now_minutes=$((10#$hour * 60 + 10#$minute))
+  IFS=: read -r hour minute <<<"$time1"
+  t1_minutes=$((10#$hour * 60 + 10#$minute))
+  IFS=: read -r hour minute <<<"$time2"
+  t2_minutes=$((10#$hour * 60 + 10#$minute))
+  age1=$(((now_minutes - t1_minutes + 1440) % 1440))
+  age2=$(((now_minutes - t2_minutes + 1440) % 1440))
+  if (( age1 <= age2 )); then target=$preset1; else target=$preset2; fi
+  if (( age1 <= age2 )); then event_epoch_minutes=$(($(date +%s) / 60 - age1));
+  else event_epoch_minutes=$(($(date +%s) / 60 - age2)); fi
+  marker="$event_epoch_minutes $target"
+  previous=""
+  [[ ! -r $SCHEDULE_MARKER_FILE ]] || read -r previous < "$SCHEDULE_MARKER_FILE"
+  if [[ $marker != "$previous" ]]; then
+    set_mode "$target" >/dev/null
+    printf '%s\n' "$marker" > "$SCHEDULE_MARKER_FILE"
+    printf '%s\n' "$target"
+  else
+    printf 'none\n'
+  fi
+}
+
+case "${1:-status}" in
+  status)
+    [[ $# -eq 0 || $# -eq 1 ]] || { usage; exit 2; }
+    status
+    ;;
+  state)
+    [[ $# -eq 1 ]] || { usage; exit 2; }
+    printf '%s %s %s %s %s %s %s %s %s %s\n' "$(status)" "$(saved_temperature)" "$(saved_saturation)" \
+      "$(current_brightness)" \
+      "$(saved_preset standard)" "$(saved_preset red-light)" \
+      "$(saved_preset candle)" "$(saved_preset black-white)" \
+      "$(saved_preset color-ink)" "$(saved_preset vivid)"
+    ;;
+  preset)
+    [[ $# -eq 2 ]] || { usage; exit 2; }
+    saved_preset "$2"
+    ;;
+  custom-list)
+    [[ $# -eq 1 ]] || { usage; exit 2; }
+    custom_list
+    ;;
+  add-preset)
+    [[ $# -eq 2 ]] || { usage; exit 2; }
+    add_preset "$2"
+    ;;
+  rename-preset)
+    [[ $# -eq 3 ]] || { usage; exit 2; }
+    rename_preset "$2" "$3"
+    ;;
+  delete-preset)
+    [[ $# -eq 2 ]] || { usage; exit 2; }
+    delete_preset "$2"
+    ;;
+  temperature)
+    [[ $# -eq 1 ]] || { usage; exit 2; }
+    saved_temperature
+    ;;
+  saturation)
+    [[ $# -eq 1 ]] || { usage; exit 2; }
+    saved_saturation
+    ;;
+  set)
+    [[ $# -eq 2 || $# -eq 7 ]] || { usage; exit 2; }
+    set_mode "$2" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}"
+    ;;
+  set-temperature)
+    [[ $# -eq 2 ]] || { usage; exit 2; }
+    set_temperature "$2"
+    ;;
+  set-saturation)
+    [[ $# -eq 2 ]] || { usage; exit 2; }
+    set_saturation "$2"
+    ;;
+  set-preset)
+    [[ $# -eq 4 || $# -eq 5 ]] || { usage; exit 2; }
+    set_preset "$2" "$3" "$4" "${5:-auto}"
+    ;;
+  reset-preset)
+    [[ $# -eq 2 ]] || { usage; exit 2; }
+    reset_preset "$2"
+    ;;
+  schedule-state)
+    [[ $# -eq 1 ]] || { usage; exit 2; }
+    schedule_state
+    ;;
+  schedule-set)
+    [[ $# -eq 6 ]] || { usage; exit 2; }
+    schedule_set "$2" "$3" "$4" "$5" "$6"
+    ;;
+  schedule-check)
+    [[ $# -eq 1 ]] || { usage; exit 2; }
+    schedule_check
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac

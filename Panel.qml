@@ -44,9 +44,12 @@ Panel {
   property string pendingCustomPreset: ""
   property bool scheduleEnabled: false
   property string scheduleTime1: "08:00"
+  property string scheduleTime1Draft: ""
   property string schedulePreset1: "standard"
   property string scheduleTime2: "20:00"
+  property string scheduleTime2Draft: ""
   property string schedulePreset2: "red-light"
+  property bool scheduleDirty: false
   property string pendingMode: ""
   property string errorMessage: ""
   property int selectedIndex: modeIndex(activeMode)
@@ -60,6 +63,9 @@ Panel {
   readonly property string hiddenPresets: String(setting("hiddenPresets", "") || "")
   readonly property bool brightnessAvailable: currentBrightness >= 1
   readonly property bool presetTransitionActive: isPresetId(pendingMode)
+  readonly property string clockTimePattern: configuredClockTimePattern()
+  readonly property bool uses12HourTime: clockTimePattern.indexOf("AP") >= 0
+    || clockTimePattern.indexOf("ap") >= 0
   readonly property var builtinModes: [
     {
       id: "standard",
@@ -167,8 +173,81 @@ Panel {
   }
 
   function openSchedule() {
+    syncScheduleDrafts()
+    scheduleDirty = false
     panelPage = "schedule"
     focusSection = "schedule"
+  }
+
+  function configuredClockTimePattern() {
+    if (bar && typeof bar.layoutEntries === "function") {
+      var sections = ["left", "center", "right"]
+      for (var sectionIndex = 0; sectionIndex < sections.length; sectionIndex++) {
+        var entries = bar.layoutEntries(sections[sectionIndex])
+        for (var entryIndex = 0; entryIndex < entries.length; entryIndex++) {
+          var entry = entries[entryIndex]
+          var id = typeof entry === "string" ? entry : String(entry.id || "")
+          if (id === "omarchy.clock")
+            return String((typeof entry === "object" && entry.format) || "dddd HH:mm")
+        }
+      }
+    }
+    return Qt.locale().timeFormat(Locale.ShortFormat)
+  }
+
+  function formatScheduleTime(value) {
+    var fields = String(value || "").split(":")
+    if (fields.length !== 2) return String(value || "")
+    var hour = Number(fields[0])
+    var minute = Number(fields[1])
+    if (!isFinite(hour) || !isFinite(minute)) return String(value || "")
+    var paddedMinute = (minute < 10 ? "0" : "") + minute
+    if (!uses12HourTime)
+      return (hour < 10 ? "0" : "") + hour + ":" + paddedMinute
+    var displayHour = hour % 12
+    if (displayHour === 0) displayHour = 12
+    var suffix = hour >= 12 ? Qt.locale().pmText : Qt.locale().amText
+    return displayHour + ":" + paddedMinute + " " + suffix
+  }
+
+  function syncScheduleDrafts() {
+    scheduleTime1Draft = formatScheduleTime(scheduleTime1)
+    scheduleTime2Draft = formatScheduleTime(scheduleTime2)
+  }
+
+  function parseScheduleTime(value) {
+    var text = String(value || "").trim().replace(/\s/g, "")
+    var upper = text.toUpperCase()
+    var locale = Qt.locale()
+    var am = String(locale.amText || "AM").replace(/\s/g, "").toUpperCase()
+    var pm = String(locale.pmText || "PM").replace(/\s/g, "").toUpperCase()
+    var meridiem = ""
+    if (am !== "" && upper.endsWith(am)) {
+      meridiem = "am"
+      text = text.slice(0, text.length - am.length)
+    } else if (pm !== "" && upper.endsWith(pm)) {
+      meridiem = "pm"
+      text = text.slice(0, text.length - pm.length)
+    } else if (upper.endsWith("AM")) {
+      meridiem = "am"
+      text = text.slice(0, -2)
+    } else if (upper.endsWith("PM")) {
+      meridiem = "pm"
+      text = text.slice(0, -2)
+    }
+
+    var match = text.match(/^(\d{1,2}):(\d{2})$/)
+    if (!match) return ""
+    var hour = Number(match[1])
+    var minute = Number(match[2])
+    if (minute < 0 || minute > 59) return ""
+    if (meridiem !== "") {
+      if (hour < 1 || hour > 12) return ""
+      hour = (hour % 12) + (meridiem === "pm" ? 12 : 0)
+    } else if (hour < 0 || hour > 23 || uses12HourTime) {
+      return ""
+    }
+    return (hour < 10 ? "0" : "") + hour + ":" + (minute < 10 ? "0" : "") + minute
   }
 
   function goBack() {
@@ -262,7 +341,29 @@ Panel {
 
   function saveSchedule() {
     if (scheduleProcess.running) return
-    scheduleProcess.command = [helperPath, "schedule-set", scheduleEnabled ? "1" : "0",
+    var firstTime = parseScheduleTime(scheduleTime1Draft)
+    var secondTime = parseScheduleTime(scheduleTime2Draft)
+    if (firstTime === "" || secondTime === "") {
+      errorMessage = uses12HourTime
+        ? "Enter times like 8:00 AM or 8:00 PM."
+        : "Enter times in 24-hour format, like 08:00 or 20:00."
+      return
+    }
+    errorMessage = ""
+    scheduleEnabled = true
+    scheduleTime1 = firstTime
+    scheduleTime2 = secondTime
+    scheduleProcess.command = [helperPath, "schedule-set", "1",
+      firstTime, schedulePreset1, secondTime, schedulePreset2]
+    scheduleProcess.running = true
+  }
+
+  function disableSchedule() {
+    if (scheduleProcess.running) return
+    errorMessage = ""
+    scheduleEnabled = false
+    scheduleDirty = true
+    scheduleProcess.command = [helperPath, "schedule-set", "0",
       scheduleTime1, schedulePreset1, scheduleTime2, schedulePreset2]
     scheduleProcess.running = true
   }
@@ -473,11 +574,15 @@ Panel {
       onStreamFinished: {
         var fields = String(text || "").trim().split(/\s+/)
         if (fields.length < 5) return
+        if (root.panelPage === "schedule" && root.scheduleDirty) return
         root.scheduleEnabled = fields[0] === "1"
         root.scheduleTime1 = fields[1]
         root.schedulePreset1 = fields[2]
         root.scheduleTime2 = fields[3]
         root.schedulePreset2 = fields[4]
+        if (root.panelPage !== "schedule"
+            || (!scheduleTime1Field.activeFocus && !scheduleTime2Field.activeFocus))
+          root.syncScheduleDrafts()
       }
     }
   }
@@ -489,7 +594,10 @@ Panel {
     onExited: function(exitCode) {
       if (exitCode !== 0)
         root.errorMessage = String(scheduleError.text || "Unable to save schedule").trim()
-      else scheduleCheckProcess.running = true
+      else {
+        root.scheduleDirty = false
+        scheduleCheckProcess.running = true
+      }
       scheduleStateProcess.running = true
     }
   }
@@ -949,7 +1057,13 @@ Panel {
               trackHeight: Style.space(16)
               cursorPad: Style.space(2)
               foreground: root.bar.foreground
-              onToggled: root.scheduleEnabled = !root.scheduleEnabled
+              onToggled: {
+                if (root.scheduleEnabled) root.disableSchedule()
+                else {
+                  root.scheduleEnabled = true
+                  root.scheduleDirty = true
+                }
+              }
             }
           }
 
@@ -963,13 +1077,18 @@ Panel {
             spacing: Style.space(6)
             TextField {
               id: scheduleTime1Field
-              width: Style.space(78)
-              text: root.scheduleTime1
-              placeholderText: "08:00"
-              inputMethodHints: Qt.ImhTime
+              width: root.uses12HourTime ? Style.space(112) : Style.space(78)
+              text: root.scheduleTime1Draft
+              placeholderText: root.uses12HourTime ? "8:00 AM" : "08:00"
+              inputMethodHints: root.uses12HourTime ? Qt.ImhNone : Qt.ImhTime
               foreground: root.bar.foreground
               font.family: root.bar.fontFamily
-              onTextChanged: root.scheduleTime1 = text
+              onTextChanged: {
+                root.scheduleTime1Draft = text
+                if (activeFocus) root.scheduleDirty = true
+              }
+              onActiveFocusChanged: if (activeFocus)
+                Qt.callLater(function() { scheduleTime1Field.selectAll() })
             }
             Dropdown {
               width: parent.width - scheduleTime1Field.width - parent.spacing
@@ -978,7 +1097,10 @@ Panel {
               options: root.presetOptions
               foreground: root.bar.foreground
               fontFamily: root.bar.fontFamily
-              onChanged: function(value) { root.schedulePreset1 = value }
+              onChanged: function(value) {
+                root.schedulePreset1 = value
+                root.scheduleDirty = true
+              }
             }
           }
 
@@ -992,13 +1114,18 @@ Panel {
             spacing: Style.space(6)
             TextField {
               id: scheduleTime2Field
-              width: Style.space(78)
-              text: root.scheduleTime2
-              placeholderText: "20:00"
-              inputMethodHints: Qt.ImhTime
+              width: root.uses12HourTime ? Style.space(112) : Style.space(78)
+              text: root.scheduleTime2Draft
+              placeholderText: root.uses12HourTime ? "8:00 PM" : "20:00"
+              inputMethodHints: root.uses12HourTime ? Qt.ImhNone : Qt.ImhTime
               foreground: root.bar.foreground
               font.family: root.bar.fontFamily
-              onTextChanged: root.scheduleTime2 = text
+              onTextChanged: {
+                root.scheduleTime2Draft = text
+                if (activeFocus) root.scheduleDirty = true
+              }
+              onActiveFocusChanged: if (activeFocus)
+                Qt.callLater(function() { scheduleTime2Field.selectAll() })
             }
             Dropdown {
               width: parent.width - scheduleTime2Field.width - parent.spacing
@@ -1007,14 +1134,19 @@ Panel {
               options: root.presetOptions
               foreground: root.bar.foreground
               fontFamily: root.bar.fontFamily
-              onChanged: function(value) { root.schedulePreset2 = value }
+              onChanged: function(value) {
+                root.schedulePreset2 = value
+                root.scheduleDirty = true
+              }
             }
           }
 
           Text {
             width: parent.width
             wrapMode: Text.Wrap
-            text: "Use 24-hour times. Scheduled changes run once at each daily switch."
+            text: root.uses12HourTime
+              ? "Use your system's 12-hour time format. Scheduled changes run once at each daily switch."
+              : "Use your system's 24-hour time format. Scheduled changes run once at each daily switch."
             color: Qt.darker(root.bar.foreground, 1.5)
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.caption
@@ -1022,7 +1154,7 @@ Panel {
 
           Button {
             width: parent.width
-            text: "Save Schedule"
+            text: "Save & Activate Schedule"
             iconText: "󰆓"
             bordered: true
             foreground: root.bar.foreground
